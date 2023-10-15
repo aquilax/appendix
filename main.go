@@ -1,18 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+const ENV_APPENDIX_LOG = "APPENDIX_LOG"
+const ENV_API_TOKEN = "API_TOKEN"
+const EmptyMessageID MessageID = "-"
+
+var newLine = []byte{10}
 
 type NodeID string
 type Namespace string // dataset.v1
@@ -24,8 +31,9 @@ const MessageOperatorAdd MessageOperator = "ADD"
 const MessageOperatorUpdate MessageOperator = "UPD"
 const MessageOperatorDelete MessageOperator = "DEL"
 
+// messageId = "nsid.nodeid.messageID"
+
 type MessageMeta struct {
-	NodeID    NodeID          `json:"node_id"`
 	Namespace Namespace       `json:"ns"`
 	Operation MessageOperator `json:"op"`
 	MessageID MessageID       `json:"message_id"`
@@ -43,18 +51,56 @@ type Payload struct {
 	Messages []Message `json:"messages"`
 }
 
+func (p *Payload) UnmarshalJSON(data []byte) error {
+	required := struct {
+		Cursor   *MessageID `json:"cursor"`
+		Messages []Message  `json:"messages"`
+	}{}
+	if err := json.Unmarshal(data, &required); err != nil {
+		return err
+	} else if required.Cursor == nil {
+		return errors.New("missing: cursor")
+	} else if required.Messages == nil {
+		return errors.New("missing: messages")
+	}
+	p.Cursor = *required.Cursor
+	p.Messages = required.Messages
+	return nil
+}
+
 func main() {
-	app := NewApp()
+	app := NewApp(os.Stdout)
+	apiToken := os.Getenv(ENV_API_TOKEN)
+	err := app.loadStorage(os.Getenv(ENV_APPENDIX_LOG))
+	if err != nil {
+		os.Exit(1)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-NodeID")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if r.Method == http.MethodOptions {
+			return // Preflight
+		}
+
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
+
+		authorization := r.Header.Get("Authorization")
+		idToken := strings.TrimSpace(strings.Replace(authorization, "Bearer", "", 1))
+		if apiToken != "" && apiToken != idToken {
+			http.Error(w, `{"error": "forbidden"}`, http.StatusForbidden)
+			return
+		}
+
 		var p Payload
 		err := json.NewDecoder(r.Body).Decode(&p)
 		if err != nil {
-			fmt.Println(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -100,12 +146,14 @@ var ErrBadRequest = errors.New(`{"error": "bad request"}`)
 
 type App struct {
 	sync.RWMutex
+	output  io.Writer
 	storage []Message
 	ids     map[MessageID]any
 }
 
-func NewApp() *App {
+func NewApp(log io.Writer) *App {
 	return &App{
+		output:  log,
 		storage: make([]Message, 0),
 		ids:     make(map[MessageID]any),
 	}
@@ -133,7 +181,12 @@ func (a *App) saveRequest(p *Payload) error {
 		if err != nil {
 			return ErrBadRequest
 		}
-		log.Println(msg)
+		if _, err := a.output.Write(msg); err != nil {
+			panic(err)
+		}
+		if _, err = a.output.Write(newLine); err != nil {
+			panic(err)
+		}
 	}
 	return nil
 }
@@ -142,14 +195,44 @@ func (a *App) getResponse(messageID MessageID) (*Payload, error) {
 	a.RLock()
 	defer a.RUnlock()
 
+	messages := a.getMessagesAfter(messageID)
+
+	return &Payload{
+		Cursor: func() MessageID {
+			l := len(messages)
+			if l > 0 {
+				return messages[l-1].ID
+			}
+			return EmptyMessageID
+		}(),
+		Messages: messages,
+	}, nil
+}
+
+func (a *App) getMessagesAfter(messageID MessageID) []Message {
 	for i := len(a.storage) - 1; i >= 0; i-- {
 		if a.storage[i].ID == messageID {
-			return &Payload{
-				Messages: a.storage[i+1:],
-			}, nil
+			return a.storage[i+1:]
 		}
 	}
-	return &Payload{
-		Messages: a.storage[:],
-	}, nil
+	return a.storage[:]
+}
+
+func (a *App) loadStorage(fileName string) error {
+	f, err := os.Open(fileName)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	d := json.NewDecoder(bufio.NewReader(f))
+	for {
+		var m Message
+		if err := d.Decode(&m); err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		a.storage = append(a.storage, m)
+	}
 }
