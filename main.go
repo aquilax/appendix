@@ -160,11 +160,13 @@ func NewApp(log io.Writer) *App {
 }
 
 func (a *App) processPayload(p *Payload) (*Payload, error) {
+	messages := a.getMessagesAfter(p.Cursor)
+
 	err := a.saveRequest(p)
 	if err != nil {
 		return nil, err
 	}
-	return a.getResponse(p.Cursor)
+	return a.getResponse(p.Cursor, messages), nil
 }
 
 func (a *App) saveRequest(p *Payload) error {
@@ -191,12 +193,7 @@ func (a *App) saveRequest(p *Payload) error {
 	return nil
 }
 
-func (a *App) getResponse(messageID MessageID) (*Payload, error) {
-	a.RLock()
-	defer a.RUnlock()
-
-	messages := a.getMessagesAfter(messageID)
-
+func (a *App) getResponse(messageID MessageID, messages []Message) *Payload {
 	return &Payload{
 		Cursor: func() MessageID {
 			l := len(messages)
@@ -206,10 +203,13 @@ func (a *App) getResponse(messageID MessageID) (*Payload, error) {
 			return EmptyMessageID
 		}(),
 		Messages: messages,
-	}, nil
+	}
 }
 
 func (a *App) getMessagesAfter(messageID MessageID) []Message {
+	a.RLock()
+	defer a.RUnlock()
+
 	for i := len(a.storage) - 1; i >= 0; i-- {
 		if a.storage[i].ID == messageID {
 			return a.storage[i+1:]
@@ -233,6 +233,10 @@ func (a *App) loadStorage(fileName string) error {
 		} else if err != nil {
 			return err
 		}
+		if _, found := a.ids[m.ID]; found {
+			continue
+		}
+		a.ids[m.ID] = nil
 		a.storage = append(a.storage, m)
 	}
 }
