@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,8 +29,6 @@ type Timestamp int64
 const MessageOperatorAdd MessageOperator = "ADD"
 const MessageOperatorUpdate MessageOperator = "UPD"
 const MessageOperatorDelete MessageOperator = "DEL"
-
-// messageId = "nsid.nodeid.messageID"
 
 type MessageMeta struct {
 	Namespace Namespace       `json:"ns"`
@@ -69,12 +66,20 @@ func (p *Payload) UnmarshalJSON(data []byte) error {
 }
 
 func main() {
-	app := NewApp(os.Stdout)
+	fileName := os.Getenv(ENV_APPENDIX_LOG)
 	apiToken := os.Getenv(ENV_API_TOKEN)
-	err := app.loadStorage(os.Getenv(ENV_APPENDIX_LOG))
+
+	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		os.Exit(1)
+		panic(err)
 	}
+	defer f.Close()
+
+	app := NewApp(f)
+	if err := app.loadStorage(); err != nil {
+		panic(err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -124,9 +129,8 @@ func main() {
 		Handler: mux,
 	}
 	go func() {
-		err := srv.ListenAndServe()
-		if err != nil {
-			os.Exit(1)
+		if err := srv.ListenAndServe(); err != nil {
+			panic(err)
 		}
 	}()
 
@@ -146,14 +150,14 @@ var ErrBadRequest = errors.New(`{"error": "bad request"}`)
 
 type App struct {
 	sync.RWMutex
-	output  io.Writer
+	stream  io.ReadWriter
 	storage []Message
 	ids     map[MessageID]any
 }
 
-func NewApp(log io.Writer) *App {
+func NewApp(log io.ReadWriter) *App {
 	return &App{
-		output:  log,
+		stream:  log,
 		storage: make([]Message, 0),
 		ids:     make(map[MessageID]any),
 	}
@@ -183,10 +187,10 @@ func (a *App) saveRequest(p *Payload) error {
 		if err != nil {
 			return ErrBadRequest
 		}
-		if _, err := a.output.Write(msg); err != nil {
+		if _, err := a.stream.Write(msg); err != nil {
 			panic(err)
 		}
-		if _, err = a.output.Write(newLine); err != nil {
+		if _, err = a.stream.Write(newLine); err != nil {
 			panic(err)
 		}
 	}
@@ -218,14 +222,8 @@ func (a *App) getMessagesAfter(messageID MessageID) []Message {
 	return a.storage[:]
 }
 
-func (a *App) loadStorage(fileName string) error {
-	f, err := os.Open(fileName)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	d := json.NewDecoder(bufio.NewReader(f))
+func (a *App) loadStorage() error {
+	d := json.NewDecoder(a.stream)
 	for {
 		var m Message
 		if err := d.Decode(&m); err == io.EOF {
